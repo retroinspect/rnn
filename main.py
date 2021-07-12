@@ -85,25 +85,27 @@ n_train_data = int(len_data * 0.9)
 n_val_data = len_data - n_train_data
 train_dataset, val_dataset = random_split(mydataset, [n_train_data, n_val_data])
 
-batch_size = 23
+batch_size = 32
 
 def labelToTensor(label):
   return torch.tensor([mydataset.all_categories.index(label)], dtype=torch.long)
 
 def collate_batch(batch):
-  # TODO packed
-  
   # print(batch) # {"name": ["sanga", "sangmin"], "label": ["Korea", "Korea"]}
-  name_lengths = [len(batch[i]["name"]) for i in range(len(batch))]
+
+  # TODO employ pack_padded_sequence
+  names = [ batch[i]["name"] for i in range(len(batch)) ]
+  name_lengths = torch.LongTensor([len(name) for name in names])
   max_len = max(name_lengths)
-
-  # packed = rnn_utils.pack_sequence(,,,)
-
+  names = torch.cat([nameToTensor(pad(name, max_len)) for name in names], dim=1)
+  
   labels = torch.LongTensor([labelToTensor(batch[i]["label"]) for i in range(len(batch))])
-  # print(labels)
 
-  padded_names = [nameToTensor(pad(batch[i]["name"], max_len)) for i in range(len(batch))]
-  names = torch.cat(padded_names, dim=1)
+  name_lengths, sorted_idx = name_lengths.sort(0, descending=True)
+  names = names[:, sorted_idx]
+  labels = labels[sorted_idx]
+
+  packed_names = pack_padded_sequence(names, name_lengths.tolist())
 
   return (names, labels)
 
@@ -122,6 +124,10 @@ def nameToTensor(line):
   for li, letter in enumerate(line):
     tensor[li][0][letterToIndex(letter)] = 1
   return tensor
+
+def thresholding(prediction):
+  confidence, pred_label = torch.max(prediction, 1)
+  return pred_label
 
 import torch.nn as nn
 
@@ -164,15 +170,11 @@ learning_rate = 0.005 # for SGD
 import time
 import math
 
-n_iters = 5
+n_iters = 100
 print_every = 1
 plot_every = 1000
 optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
 # optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-
-# Keep track of losses for plotting
-current_loss = 0
-all_losses = []
 
 def timeSince(since):
     now = time.time()
@@ -189,7 +191,6 @@ train_accuracy_iter = np.zeros(n_iters, dtype=float)  # Temporary numpy array to
 valid_accuracy_iter = np.zeros(n_iters, dtype=float)
 
 for iter in range(n_iters):
-
   # Training
   total_loss, total_cnt, correct_cnt = 0.0, 0.0, 0.0
 
@@ -197,7 +198,6 @@ for iter in range(n_iters):
   for batch_idx, sample_batched in enumerate(train_loader):
 
     name_tensor, label_tensor = sample_batched
-  
     hidden = model.initHidden(name_tensor.size(1))
 
     if useGPU:
@@ -216,34 +216,39 @@ for iter in range(n_iters):
     optimizer.step()
 
     total_loss += loss.item() # accumulate loss
+    total_cnt += label_tensor.size(0) # accumulate the number of data
+    correct_cnt += (label_tensor == thresholding(pred)).sum().item() # number of correct
 
-    # x, target이 뭘까
-    total_cnt += batch_size # accumulate the number of data
-  #   correct_cnt += (thresholding(prediction) == target.data).sum().item()  # accumulate the number of correct predictions
-
-  # accuracy = correct_cnt * 1.0 / total_cnt  # calculate accuracy  (#accumulated-correct-prediction/#accumulated-data)
-  print("total_loss: ", total_loss)
-  print("total cnt: ", total_cnt)
+  accuracy = correct_cnt * 1.0 / total_cnt  # calculate accuracy  (#accumulated-correct-prediction/#accumulated-data)
   train_loss_iter[iter] = total_loss / total_cnt # calculate and save loss (#accumulated-loss/#accumulated-data)
-  # train_accuracy_iter[iter] = accuracy  # save accuracy
+  train_accuracy_iter[iter] = accuracy  # save accuracy
 
+  # Validation
+  total_loss, total_cnt, correct_cnt = 0.0, 0.0, 0.0
+  for batch_idx, sample_batched in enumerate(valid_loader):
+    with torch.no_grad():
+      name_tensor, label_tensor = sample_batched  
+      hidden = model.initHidden(name_tensor.size(1))
+      if useGPU:
+        label_tensor = label_tensor.cuda()
+        name_tensor = name_tensor.cuda()
+        hidden = hidden.cuda()
 
-  # TODO Validation
-  # total_loss, total_cnt, correct_cnt = 0.0, 0.0, 0.0
-  # for batch_idx, sample_batched in enumerate(valid_loader):
-  #   with torch.no_grad():
-  #     if useGPU:
+      for i in range(name_tensor.size(0)):
+        pred, hidden = model(name_tensor[i], hidden)
 
-    # output, loss = train(label_tensor, name_tensor)
-    # current_loss += loss
+    loss = criterion(pred, label_tensor)
+    total_loss += loss.item() # accumulate loss
+    total_cnt += label_tensor.size(0) # accumulate the number of data
+    correct_cnt += (label_tensor == thresholding(pred)).sum().item() # number of correct
+      
+  accuracy = correct_cnt * 1.0 / total_cnt  # calculate accuracy  (#accumulated-correct-prediction/#accumulated-data)
+  valid_loss_iter[iter] = total_loss / total_cnt # calculate and save loss (#accumulated-loss/#accumulated-data)
+  valid_accuracy_iter[iter] = accuracy  # save accuracy
 
-  # Print iter number, loss, name and guess
-  # if iter % print_every == 0:
-  print(f"[{iter}/{n_iters}] ({timeSince(start)}) Train Loss : {train_loss_iter[iter]:.4f}")
+  # Print iter number, loss
+  print(f"[{iter}/{n_iters}] Train Loss : {train_loss_iter[iter]:.4f} Train Acc : {train_accuracy_iter[iter]:.2f} \
+  Valid Loss : {valid_loss_iter[iter]:.4f} Valid Acc : {valid_accuracy_iter[iter]:.2f}")
 
-  # Add current loss avg to list of losses
-  if iter % plot_every == 0:
-      all_losses.append(current_loss / plot_every)
-      current_loss = 0
 
 torch.save(model, 'char-rnn-classification.pt')
