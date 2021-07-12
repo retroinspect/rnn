@@ -5,6 +5,7 @@ import os
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
+from torch.nn.utils.rnn import pack_padded_sequence
 
 import unicodedata
 import string
@@ -43,12 +44,12 @@ class NameCountryDataset(Dataset):
     datapath = os.path.join(self.root_dir, '*.txt')
 
     for filename in findFiles(datapath):
-      category = os.path.splitext(os.path.basename(filename))[0]
-      self.all_categories.append(category)
+      label = os.path.splitext(os.path.basename(filename))[0]
+      self.all_categories.append(label)
       lines = readLines(filename)
 
       for name in lines:
-        self.data.append({'name': name, 'label': category})
+        self.data.append({'name': name, 'label': label})
         if (len(name) > self.name_len):
           self.name_len = len(name)
 
@@ -66,15 +67,11 @@ class NameCountryDataset(Dataset):
     
     return sample
 
-class Pad(object):
-  def __init__(self, output_len):
-    assert isinstance(output_len, int)
-    self.output_len = output_len
-  
-  def __call__(self, sample):
-    name, label = sample['name'], sample['label']
-    name += "0" * (self.output_len - len(name))
-    return {"name": name, "label": label}
+def pad(name, max_len):
+  # print(f"padding {name} with {max_len}")
+  name += "0" * (max_len - len(name))
+  # print(name)
+  return name
 
 mydataset = NameCountryDataset()
 print(mydataset.all_categories)
@@ -88,10 +85,31 @@ n_train_data = int(len_data * 0.9)
 n_val_data = len_data - n_train_data
 train_dataset, val_dataset = random_split(mydataset, [n_train_data, n_val_data])
 
-batch_size = 1
+batch_size = 23
 
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-valid_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True)
+def labelToTensor(label):
+  return torch.tensor([mydataset.all_categories.index(label)], dtype=torch.long)
+
+def collate_batch(batch):
+  # TODO packed
+  
+  # print(batch) # {"name": ["sanga", "sangmin"], "label": ["Korea", "Korea"]}
+  name_lengths = [len(batch[i]["name"]) for i in range(len(batch))]
+  max_len = max(name_lengths)
+
+  # packed = rnn_utils.pack_sequence(,,,)
+
+  labels = torch.LongTensor([labelToTensor(batch[i]["label"]) for i in range(len(batch))])
+  # print(labels)
+
+  padded_names = [nameToTensor(pad(batch[i]["name"], max_len)) for i in range(len(batch))]
+  names = torch.cat(padded_names, dim=1)
+
+  return (names, labels)
+
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_batch)
+valid_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_batch)
 
 def letterToIndex(letter):
   if (letter == '0'):
@@ -99,7 +117,7 @@ def letterToIndex(letter):
   return all_letters.find(letter) + 1
 
 # one-hot vector
-def lineToTensor(line):
+def nameToTensor(line):
   tensor = torch.zeros(len(line), 1, n_letters)
   for li, letter in enumerate(line):
     tensor[li][0][letterToIndex(letter)] = 1
@@ -118,51 +136,39 @@ class RNN(nn.Module):
         self.softmax = nn.LogSoftmax(dim=1)
 
     def forward(self, input, hidden):
-        combined = torch.cat((input, hidden), 1)
+        combined = torch.cat((input, hidden), dim=1)
         hidden = self.i2h(combined)
         output = self.i2o(combined)
         output = self.softmax(output)
         return output, hidden
 
-    def initHidden(self):
-        return torch.zeros(1, self.hidden_size)
+    def initHidden(self, sample_batched_size):
+      return torch.zeros(sample_batched_size, self.hidden_size)
 
 n_hidden = 128
 n_categories = 18
 model = RNN(n_letters, n_hidden, n_categories)
-# optimizer는 없어도 되는건가???
 
 if useGPU:
-  model = model.to(device)
+  model.to(device)
 
-def categoryFromOutput(output, dataset):
+def labelFromOutput(output, dataset):
   top_n, top_i = output_topk(1)
-  category_i = top_i[0].item()
-  return dataset.all_categories[category_i], category_i
+  label_i = top_i[0].item()
+  return dataset.all_categories[label_i], label_i
 
 criterion = nn.NLLLoss()
-learning_rate = 0.005
-
-def train(category_tensor, line_tensor):
-  hidden = model.initHidden()
-
-  for i in range(line_tensor.size()[0]):
-    output, hidden = rnn(line_tensor[i], hidden)
-  
-  loss = criterion(output, category_tensor)
-  loss.backward()
-
-  for p in rnn.parameters():
-    p.data.add_(p.grad.data, alpha=-learning_rate)
-  
-  return output, loss.item()
+learning_rate = 0.005 # for SGD
+# learning_rate = 0.0001 # for Adam
 
 import time
 import math
 
-n_iters = 1
-print_every = 10
+n_iters = 5
+print_every = 1
 plot_every = 1000
+optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
+# optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
 # Keep track of losses for plotting
 current_loss = 0
@@ -176,7 +182,6 @@ def timeSince(since):
     return '%dm %ds' % (m, s)
 
 start = time.time()
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 #  numpy arrays to save loss & accuracy from each epoch
 train_loss_iter = np.zeros(n_iters, dtype=float)  # Temporary numpy array to save loss for each epoch
 valid_loss_iter = np.zeros(n_iters, dtype=float)
@@ -190,25 +195,23 @@ for iter in range(n_iters):
 
   # for each mini-batch
   for batch_idx, sample_batched in enumerate(train_loader):
-    # print(sample_batched)
-    names = sample_batched["name"][0]
-    labels = sample_batched["label"][0]
 
-    # batch를 어떻게 처리해야할까..?
-    category_tensor = torch.tensor([mydataset.all_categories.index(labels)], dtype=torch.long)
-    line_tensor = lineToTensor(names)
-    hidden = model.initHidden()
+    name_tensor, label_tensor = sample_batched
+  
+    hidden = model.initHidden(name_tensor.size(1))
 
     if useGPU:
-      category_tensor = category_tensor.cuda()
-      line_tensor = line_tensor.cuda()
+      label_tensor = label_tensor.cuda()
+      name_tensor = name_tensor.cuda()
       hidden = hidden.cuda()
 
-    for i in range(line_tensor.size()[0]):
-      pred, hidden = model(line_tensor[i], hidden)
+    #feed into model letter by letter
+    for i in range(name_tensor.size(0)):
+      pred, hidden = model(name_tensor[i], hidden)
 
     optimizer.zero_grad()
-    loss = criterion(pred, category_tensor)
+    model.zero_grad()
+    loss = criterion(pred, label_tensor)
     loss.backward()
     optimizer.step()
 
@@ -224,21 +227,23 @@ for iter in range(n_iters):
   train_loss_iter[iter] = total_loss / total_cnt # calculate and save loss (#accumulated-loss/#accumulated-data)
   # train_accuracy_iter[iter] = accuracy  # save accuracy
 
-  # Validation
+
+  # TODO Validation
   # total_loss, total_cnt, correct_cnt = 0.0, 0.0, 0.0
   # for batch_idx, sample_batched in enumerate(valid_loader):
   #   with torch.no_grad():
   #     if useGPU:
 
-    # output, loss = train(category_tensor, line_tensor)
+    # output, loss = train(label_tensor, name_tensor)
     # current_loss += loss
 
   # Print iter number, loss, name and guess
   # if iter % print_every == 0:
-  print(f"[{iter}/{n_iters}] Train Loss : {train_loss_iter[iter]:.4f}")
+  print(f"[{iter}/{n_iters}] ({timeSince(start)}) Train Loss : {train_loss_iter[iter]:.4f}")
 
   # Add current loss avg to list of losses
   if iter % plot_every == 0:
       all_losses.append(current_loss / plot_every)
       current_loss = 0
 
+torch.save(model, 'char-rnn-classification.pt')
